@@ -8,10 +8,14 @@ namespace {
 
 constexpr wchar_t kWindowClassName[] = L"KeepAwakeWindowClass";
 constexpr wchar_t kWindowTitle[] = L"awake";
-constexpr wchar_t kLabelText[] = L"awake";
+constexpr wchar_t kCheckboxText[] = L"awake";
 constexpr int kWindowWidth = 360;
 constexpr int kWindowHeight = 180;
-constexpr int kLabelFontHeight = 32;
+constexpr int kCheckboxFontHeight = 32;
+constexpr int kCheckboxControlId = 101;
+// 文字两侧留白，以及勾选框与文字之间的间距。
+constexpr int kCheckboxPadding = 12;
+constexpr int kCheckboxTextSpacing = 8;
 // 分开使用两个定时器，避免移动确认影响闲置隐藏计时。
 constexpr UINT_PTR kCursorHideTimerId = 1;
 constexpr UINT_PTR kCursorDebounceTimerId = 2;
@@ -25,9 +29,9 @@ int ScaleForDpi(int value, UINT dpi) {
   return MulDiv(value, static_cast<int>(dpi), USER_DEFAULT_SCREEN_DPI);
 }
 
-HFONT CreateLabelFont(UINT dpi) {
+HFONT CreateCheckboxFont(UINT dpi) {
   return CreateFontW(
-      ScaleForDpi(kLabelFontHeight, dpi),
+      ScaleForDpi(kCheckboxFontHeight, dpi),
       0,
       0,
       0,
@@ -43,28 +47,10 @@ HFONT CreateLabelFont(UINT dpi) {
       L"Segoe UI");
 }
 
-class ExecutionStateGuard {
-public:
-  ExecutionStateGuard()
-      : active_(SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED) != 0) {}
-
-  ~ExecutionStateGuard() {
-    if (active_) {
-      SetThreadExecutionState(ES_CONTINUOUS);
-    }
-  }
-
-  ExecutionStateGuard(const ExecutionStateGuard&) = delete;
-  ExecutionStateGuard& operator=(const ExecutionStateGuard&) = delete;
-
-  [[nodiscard]] bool is_active() const { return active_; }
-
-private:
-  bool active_;
-};
-
 struct WindowState {
-  HFONT label_font = nullptr;
+  HFONT checkbox_font = nullptr;
+  HWND checkbox = nullptr;
+  bool prevent_sleep = false;
   LONG_PTR window_style = 0;
   LONG_PTR window_ex_style = 0;
   WINDOWPLACEMENT placement{};
@@ -75,6 +61,51 @@ struct WindowState {
   int cursor_movement_confirmations = 0;
   bool cursor_debounce_active = false;
 };
+
+bool EnableSleepBlocking(WindowState& state) {
+  if (SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED) == 0) {
+    return false;
+  }
+  state.prevent_sleep = true;
+  return true;
+}
+
+void DisableSleepBlocking(WindowState& state) {
+  if (!state.prevent_sleep) {
+    return;
+  }
+  SetThreadExecutionState(ES_CONTINUOUS);
+  state.prevent_sleep = false;
+}
+
+// 按当前字体测量勾选框尺寸，并将其移动到客户区正中。
+void LayoutCheckbox(HWND hwnd, WindowState& state, UINT dpi) {
+  if (state.checkbox == nullptr || state.checkbox_font == nullptr) {
+    return;
+  }
+
+  HDC dc = GetDC(hwnd);
+  HFONT old_font = static_cast<HFONT>(SelectObject(dc, state.checkbox_font));
+  RECT text_rect{0, 0, 0, 0};
+  DrawTextW(dc, kCheckboxText, -1, &text_rect, DT_CALCRECT | DT_SINGLELINE);
+  SelectObject(dc, old_font);
+  ReleaseDC(hwnd, dc);
+
+  const int text_height = text_rect.bottom - text_rect.top;
+  const int width = (text_rect.right - text_rect.left) + text_height +
+                    ScaleForDpi(kCheckboxTextSpacing, dpi) +
+                    ScaleForDpi(kCheckboxPadding, dpi);
+  const int height = text_height + ScaleForDpi(kCheckboxPadding, dpi);
+
+  RECT client_rect{};
+  GetClientRect(hwnd, &client_rect);
+  MoveWindow(state.checkbox,
+             (client_rect.right - width) / 2,
+             (client_rect.bottom - height) / 2,
+             width,
+             height,
+             TRUE);
+}
 
 // 重置闲置计时，并恢复本窗口的光标显示状态。
 void ResetCursorHideTimer(HWND hwnd, WindowState& state) {
@@ -146,6 +177,8 @@ bool EnterFullscreen(HWND hwnd, WindowState& state) {
   }
 
   state.is_fullscreen = true;
+  ShowWindow(state.checkbox, SW_HIDE);
+  SetFocus(hwnd);
   StartCursorHideTimer(hwnd, state);
   InvalidateRect(hwnd, nullptr, TRUE);
   return true;
@@ -169,6 +202,8 @@ void ExitFullscreen(HWND hwnd, WindowState& state) {
                    SWP_NOOWNERZORDER | SWP_NOACTIVATE);
   SetWindowPlacement(hwnd, &state.placement);
   state.is_fullscreen = false;
+  ShowWindow(state.checkbox, SW_SHOW);
+  LayoutCheckbox(hwnd, state, GetDpiForWindow(hwnd));
   InvalidateRect(hwnd, nullptr, TRUE);
 }
 
@@ -191,18 +226,44 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
       return TRUE;
     }
 
-    case WM_CREATE:
-      state->label_font = CreateLabelFont(GetDpiForWindow(hwnd));
+    case WM_CREATE: {
+      state->checkbox_font = CreateCheckboxFont(GetDpiForWindow(hwnd));
+      state->checkbox = CreateWindowExW(
+          0,
+          L"BUTTON",
+          kCheckboxText,
+          WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+          0,
+          0,
+          0,
+          0,
+          hwnd,
+          reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCheckboxControlId)),
+          reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(hwnd, GWLP_HINSTANCE)),
+          nullptr);
+      if (state->checkbox != nullptr) {
+        SendMessageW(state->checkbox,
+                     WM_SETFONT,
+                     reinterpret_cast<WPARAM>(state->checkbox_font),
+                     TRUE);
+        SetFocus(state->checkbox);
+        LayoutCheckbox(hwnd, *state, GetDpiForWindow(hwnd));
+      }
       return 0;
+    }
 
     case WM_DPICHANGED: {
       const UINT dpi = LOWORD(wparam);
-      HFONT new_font = CreateLabelFont(dpi);
+      HFONT new_font = CreateCheckboxFont(dpi);
       if (new_font != nullptr) {
-        if (state->label_font != nullptr) {
-          DeleteObject(state->label_font);
+        if (state->checkbox_font != nullptr) {
+          DeleteObject(state->checkbox_font);
         }
-        state->label_font = new_font;
+        state->checkbox_font = new_font;
+        SendMessageW(state->checkbox,
+                     WM_SETFONT,
+                     reinterpret_cast<WPARAM>(state->checkbox_font),
+                     TRUE);
       }
 
       const auto* suggested_rect = reinterpret_cast<const RECT*>(lparam);
@@ -213,9 +274,29 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
                    suggested_rect->right - suggested_rect->left,
                    suggested_rect->bottom - suggested_rect->top,
                    SWP_NOZORDER | SWP_NOACTIVATE);
+      LayoutCheckbox(hwnd, *state, dpi);
       InvalidateRect(hwnd, nullptr, TRUE);
       return 0;
     }
+
+    case WM_COMMAND:
+      if (LOWORD(wparam) == kCheckboxControlId && HIWORD(wparam) == BN_CLICKED) {
+        const bool checked =
+            SendMessageW(state->checkbox, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        if (checked) {
+          if (!EnableSleepBlocking(*state)) {
+            SendMessageW(state->checkbox, BM_SETCHECK, BST_UNCHECKED, 0);
+            MessageBoxW(hwnd,
+                        L"Failed to request the system stay awake.",
+                        kWindowTitle,
+                        MB_OK | MB_ICONERROR);
+          }
+        } else {
+          DisableSleepBlocking(*state);
+        }
+        return 0;
+      }
+      break;
 
     case WM_LBUTTONDBLCLK:
       ToggleFullscreen(hwnd, *state);
@@ -338,15 +419,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
         FillRect(dc, &client_rect, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
       } else {
         FillRect(dc, &client_rect, reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1));
-        SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, GetSysColor(COLOR_WINDOWTEXT));
-        HFONT old_font = static_cast<HFONT>(SelectObject(dc, state->label_font));
-        DrawTextW(dc,
-                  kLabelText,
-                  -1,
-                  &client_rect,
-                  DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        SelectObject(dc, old_font);
       }
 
       EndPaint(hwnd, &paint);
@@ -354,18 +426,20 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
     }
 
     case WM_SIZE:
+      LayoutCheckbox(hwnd, *state, GetDpiForWindow(hwnd));
       InvalidateRect(hwnd, nullptr, TRUE);
       return 0;
 
     case WM_DESTROY:
+      DisableSleepBlocking(*state);
       ResetCursorHideTimer(hwnd, *state);
       PostQuitMessage(0);
       return 0;
 
     case WM_NCDESTROY:
-      if (state != nullptr && state->label_font != nullptr) {
-        DeleteObject(state->label_font);
-        state->label_font = nullptr;
+      if (state != nullptr && state->checkbox_font != nullptr) {
+        DeleteObject(state->checkbox_font);
+        state->checkbox_font = nullptr;
       }
       return DefWindowProcW(hwnd, message, wparam, lparam);
 
@@ -380,15 +454,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_command) {
   SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-
-  ExecutionStateGuard power_guard;
-  if (!power_guard.is_active()) {
-    MessageBoxW(nullptr,
-                L"Failed to request the system stay awake.",
-                kWindowTitle,
-                MB_OK | MB_ICONERROR);
-    return 1;
-  }
 
   WindowState window_state;
 
